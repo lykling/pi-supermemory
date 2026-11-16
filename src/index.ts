@@ -3,12 +3,15 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { SupermemoryClient } from "./api.ts";
 import { resolveSettings } from "./config.ts";
-import { formatMemoryContext } from "./context.ts";
+import { formatMemoryContext, memoryId } from "./context.ts";
 import { isFullyPrivate, stripPrivateContent } from "./privacy.ts";
 import { getProjectName, getProjectIdentity, getProjectTag, getScopeFilters } from "./tags.ts";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const PLUGIN_NAME = "@lykling/pi-supermemory";
+
+/** Prompts shorter than this make poor semantic search queries; snapshot covers them. */
+const MIN_SEARCH_PROMPT_LENGTH = 16;
 
 /**
  * Persistent Supermemory memory for pi.
@@ -16,6 +19,10 @@ const PLUGIN_NAME = "@lykling/pi-supermemory";
  * Reuses the Supermemory cloud account already configured for opencode
  * (same API key, same per-repo container tags), so memories are shared
  * across both agents.
+ *
+ * Recall strategy (hybrid): small deterministic preload (profile + recent
+ * snapshot) at session start, per-turn reasoned recall via the tool
+ * thereafter, and re-injection after context compaction.
  */
 export default function supermemoryExtension(pi: ExtensionAPI) {
   const settings = resolveSettings();
@@ -42,8 +49,8 @@ export default function supermemoryExtension(pi: ExtensionAPI) {
       "'profile' to view the user profile, 'forget' to remove a memory.",
     promptSnippet: "Search, add, list, or forget persistent memories shared across sessions and agents",
     promptGuidelines: [
-      "Use supermemory with mode=search when starting a task that may build on earlier work in this project, or when the user references past decisions or preferences.",
-      "Use supermemory with mode=add when the user asks to remember something, or when a durable fact, preference, or error-solution worth keeping emerges.",
+      "Recall discipline: before answering, silently decide whether saved memory would materially improve THIS reply. Use supermemory mode=search when starting a task that may build on earlier sessions, when the user references past decisions or preferences, or when the topic shifts to something previously discussed. Skip recall when the message is self-contained, trivial, or you already recalled this topic and it has not shifted. Fold results into your answer without narrating the search.",
+      "Before storing with mode=add, search first for near-duplicates: if the tool warns about similar existing memories, forget the outdated one (mode=forget with its memoryId) and then add, instead of stacking similar entries.",
     ],
     parameters: Type.Object({
       mode: StringEnum(["add", "search", "profile", "list", "forget", "help"], {
@@ -51,6 +58,11 @@ export default function supermemoryExtension(pi: ExtensionAPI) {
       }),
       content: Type.Optional(
         Type.String({ description: "Memory content to store (mode=add)" }),
+      ),
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Skip the near-duplicate check (mode=add)",
+        }),
       ),
       query: Type.Optional(Type.String({ description: "Search query (mode=search, mode=profile)" })),
       type: Type.Optional(
@@ -79,6 +91,28 @@ export default function supermemoryExtension(pi: ExtensionAPI) {
             }
             if (isFullyPrivate(params.content)) {
               return text({ success: false, error: "Cannot store fully private content" });
+            }
+            if (settings.dedupeOnAdd && !params.force) {
+              const dup = await client.searchMemories(params.content, tags.containerTag, {
+                threshold: settings.dedupeThreshold,
+                limit: 3,
+                signal,
+              });
+              if (dup.success && dup.results.length > 0) {
+                return text({
+                  success: false,
+                  duplicate: true,
+                  message:
+                    "Highly similar memories already exist. If the new content supersedes them, " +
+                    "call forget with each memoryId below and then add again; to store anyway, " +
+                    "retry add with force=true.",
+                  similar: dup.results.map((m) => ({
+                    id: memoryId(m),
+                    similarity: m.similarity,
+                    content: (m.memory || m.chunk || m.content || m.summary || "").slice(0, 200),
+                  })),
+                });
+              }
             }
             const scope = params.scope ?? "project";
             const internalScope = scope === "user" ? "personal" : "project";
@@ -199,7 +233,7 @@ export default function supermemoryExtension(pi: ExtensionAPI) {
               success: true,
               message: "Supermemory Usage Guide (shared with opencode)",
               commands: [
-                { command: "add", description: "Store a new memory", args: ["content", "type?", "scope?"] },
+                { command: "add", description: "Store a new memory", args: ["content", "type?", "scope?", "force?"] },
                 { command: "search", description: "Search memories", args: ["query", "scope?", "limit?"] },
                 { command: "profile", description: "View user profile", args: ["query?"] },
                 { command: "list", description: "List recent memories", args: ["scope?", "limit?"] },
@@ -234,36 +268,71 @@ export default function supermemoryExtension(pi: ExtensionAPI) {
       const tag = getProjectTag(ctx.cwd);
       const prompt =
         event.messageType === "user" ? (event as { prompt: string }).prompt : "";
-      const [profileResult, projectListResult, userSearchResult] = await Promise.all([
-        settings.autoRecall === "full"
-          ? client.getProfile(tag, undefined, getScopeFilters("personal"))
-          : client.getProfile(tag),
-        settings.autoRecall === "full"
-          ? client.listMemories(tag, settings.maxProjectMemories, getScopeFilters("project"))
-          : Promise.resolve(null),
-        settings.autoRecall === "full"
-          ? client.searchMemories(prompt, tag, {
-              threshold: settings.similarityThreshold,
-              limit: settings.maxMemories,
-              filters: getScopeFilters("personal"),
-            })
-          : Promise.resolve(null),
-      ]);
+      // Short openers ("continue") are poor queries; the snapshot covers them.
+      const searchable = prompt.trim().length >= MIN_SEARCH_PROMPT_LENGTH;
+
+      let profileResult: Awaited<ReturnType<typeof client.getProfile>>;
+      let snapshotResult: Awaited<ReturnType<typeof client.listMemories>> | null = null;
+      let projectSearchResult: Awaited<ReturnType<typeof client.searchMemories>> | null = null;
+      let personalSearchResult: Awaited<ReturnType<typeof client.searchMemories>> | null = null;
+
+      if (settings.autoRecall === "profile") {
+        profileResult = await client.getProfile(tag);
+      } else if (settings.autoRecall === "full") {
+        [profileResult, snapshotResult, personalSearchResult] = await Promise.all([
+          client.getProfile(tag),
+          client.listMemories(tag, settings.maxProjectMemories, getScopeFilters("project")),
+          searchable
+            ? client.searchMemories(prompt, tag, {
+                threshold: settings.similarityThreshold,
+                limit: settings.maxMemories,
+                filters: getScopeFilters("personal"),
+              })
+            : Promise.resolve(null),
+        ]);
+      } else {
+        // hybrid (default): profile + small recent snapshot + semantic search on both scopes.
+        [profileResult, snapshotResult, projectSearchResult, personalSearchResult] = await Promise.all([
+          client.getProfile(tag, undefined, getScopeFilters("personal")),
+          client.listMemories(tag, settings.snapshotCount, getScopeFilters("project")),
+          searchable
+            ? client.searchMemories(prompt, tag, {
+                threshold: settings.similarityThreshold,
+                limit: settings.maxMemories,
+                filters: getScopeFilters("project"),
+              })
+            : Promise.resolve(null),
+          searchable
+            ? client.searchMemories(prompt, tag, {
+                threshold: settings.similarityThreshold,
+                limit: 3,
+                filters: getScopeFilters("personal"),
+              })
+            : Promise.resolve(null),
+        ]);
+      }
+
+      const relevant: Array<{ memory: NonNullable<typeof projectSearchResult>["results"][number]; scope: "project" | "personal" }> = [];
+      for (const memory of projectSearchResult?.results ?? []) {
+        relevant.push({ memory, scope: "project" });
+      }
+      for (const memory of personalSearchResult?.results ?? []) {
+        relevant.push({ memory, scope: "personal" });
+      }
 
       const content = formatMemoryContext({
         profile: profileResult.success ? profileResult.profile : null,
-        userResults: userSearchResult?.results ?? [],
-        projectResults:
-          projectListResult?.memories.map((m) => ({
-            ...m,
-            similarity: 1,
-          })) ?? [],
+        snapshot: snapshotResult?.memories ?? [],
+        relevant,
         maxProfileItems: settings.maxProfileItems,
+        maxContextChars: settings.maxContextChars,
       });
       if (!content) return;
 
+      const snapshotCount = snapshotResult?.memories.length ?? 0;
+      const relevantCount = relevant.length;
       ctx.ui.notify(
-        `Supermemory: recalled ${projectListResult?.memories.length ?? 0} project / ${userSearchResult?.results.length ?? 0} user memories`,
+        `Supermemory: recalled ${snapshotCount} snapshot / ${relevantCount} relevant memories`,
         "info",
       );
       return {
@@ -275,6 +344,35 @@ export default function supermemoryExtension(pi: ExtensionAPI) {
       };
     } catch {
       // Recall must never break the turn.
+    }
+  });
+
+  // Compaction washes out the session-start injection; re-inject the
+  // deterministic parts (profile + recent snapshot) so memory survives.
+  pi.on("session_compact", async (event, ctx) => {
+    if (!settings.compactReinject || settings.autoRecall === "off") return;
+    void event;
+    try {
+      const tag = getProjectTag(ctx.cwd);
+      const [profileResult, snapshotResult] = await Promise.all([
+        client.getProfile(tag, undefined, getScopeFilters("personal")),
+        client.listMemories(tag, settings.snapshotCount, getScopeFilters("project")),
+      ]);
+      const content = formatMemoryContext({
+        profile: profileResult.success ? profileResult.profile : null,
+        snapshot: snapshotResult?.memories ?? [],
+        relevant: [],
+        maxProfileItems: settings.maxProfileItems,
+        maxContextChars: settings.maxContextChars,
+      });
+      if (!content) return;
+      pi.sendMessage({
+        customType: "supermemory-recall",
+        content,
+        display: true,
+      });
+    } catch {
+      // Re-injection must never break the session.
     }
   });
 }

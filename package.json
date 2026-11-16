@@ -1,6 +1,6 @@
 {
   "name": "@lykling/pi-supermemory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Persistent Supermemory cloud memory for the Pi coding agent. Shares the same memory store as your opencode supermemory plugin.",
   "keywords": [
     "pi-package",

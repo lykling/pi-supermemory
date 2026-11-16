@@ -6,12 +6,22 @@ import { join } from "node:path";
 export interface SupermemorySettings {
   apiKey: string | undefined;
   baseUrl: string;
-  /** Inject recalled memories into the first prompt of each session. */
-  autoRecall: "full" | "profile" | "off";
+  /** Recall strategy for the first prompt of each session. */
+  autoRecall: "hybrid" | "full" | "profile" | "off";
   similarityThreshold: number;
   maxMemories: number;
   maxProjectMemories: number;
   maxProfileItems: number;
+  /** Size of the "recent work snapshot" injected at session start and after compaction. */
+  snapshotCount: number;
+  /** Hard budget for the injected memory context block, in characters. */
+  maxContextChars: number;
+  /** Re-inject profile + snapshot after context compaction. */
+  compactReinject: boolean;
+  /** Similarity above which add-mode refuses once and suggests replacing the old memory. */
+  dedupeThreshold: number;
+  /** Run the near-duplicate check in add mode. */
+  dedupeOnAdd: boolean;
 }
 
 const DEFAULT_BASE_URL = "https://api.supermemory.ai";
@@ -140,17 +150,30 @@ export function resolveSettings(): SupermemorySettings {
 
   const autoRecallRaw = firstString(piConfig?.autoRecall);
   const autoRecall: SupermemorySettings["autoRecall"] =
-    autoRecallRaw === "full" || autoRecallRaw === "profile" || autoRecallRaw === "off"
+    autoRecallRaw === "hybrid" ||
+    autoRecallRaw === "full" ||
+    autoRecallRaw === "profile" ||
+    autoRecallRaw === "off"
       ? autoRecallRaw
-      : "full";
+      : "hybrid";
+
+  const num = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  const bool = (value: unknown, fallback: boolean): boolean =>
+    typeof value === "boolean" ? value : fallback;
 
   return {
     apiKey,
     baseUrl,
     autoRecall,
-    similarityThreshold: 0.6,
-    maxMemories: 5,
-    maxProjectMemories: 10,
-    maxProfileItems: 5,
+    similarityThreshold: num(piConfig?.similarityThreshold, 0.6),
+    maxMemories: num(piConfig?.maxMemories, 5),
+    maxProjectMemories: num(piConfig?.maxProjectMemories, 10),
+    maxProfileItems: num(piConfig?.maxProfileItems, 5),
+    snapshotCount: num(piConfig?.snapshotCount, 3),
+    maxContextChars: num(piConfig?.maxContextChars, 4000),
+    compactReinject: bool(piConfig?.compactReinject, true),
+    dedupeThreshold: num(piConfig?.dedupeThreshold, 0.9),
+    dedupeOnAdd: bool(piConfig?.dedupeOnAdd, true),
   };
 }
